@@ -28,6 +28,8 @@
 
 #include <csignal> //interruptions
 
+using namespace std::chrono_literals;
+
 static inline float wrap_pi(float a)
 {
   while (a >  M_PI) a -= 2.0f * M_PI;
@@ -40,7 +42,7 @@ VFH_node::VFH_node()
 : Node("vfh_node")
 {
 
-    m_robot_radius   = this->declare_parameter("m_robot_radius",0.1);
+    m_robot_radius   = this->declare_parameter("m_robot_radius",0.15);
     m_cell_size      = this->declare_parameter("m_cell_size",0.05);   
     m_window_diameter= this->declare_parameter("m_window_diameter",45);
     m_sectors_number   = this->declare_parameter("sectors_number",72);
@@ -220,6 +222,8 @@ void VFH_node::scanCallback (const sensor_msgs::msg::LaserScan::SharedPtr scan_m
 
 void VFH_node::update()
 {
+	if (!goal_flag&&!wandering_mode)
+		return;
 	if (wandering_mode)
 	{
 	    desired_angle = 0.0;
@@ -750,7 +754,6 @@ int main(int argc, char *argv[])
 
     std::signal(SIGINT, signal_handler);
 
-    rclcpp::spin(node);
-
+	rclcpp::spin(node);
     return 0;
 }
