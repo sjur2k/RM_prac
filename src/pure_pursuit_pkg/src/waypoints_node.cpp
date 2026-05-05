@@ -38,6 +38,11 @@ class WayPointsNode : public rclcpp::Node{
         pure_pursuit_pkg::msg::WayPointPath path_msg;
         geometry_msgs::msg::Point p;
         int n = points.size();
+		
+		if (closed)
+			RCLCPP_INFO(this->get_logger(),"Closed path");
+		else
+			RCLCPP_INFO(this->get_logger(),"Open path");
 
         for(int i=0;i<n;i++){
 
@@ -48,7 +53,7 @@ class WayPointsNode : public rclcpp::Node{
 
             RCLCPP_INFO(this->get_logger(),"Path: x: %.2f y: %.2f",path_msg.points[i].x,path_msg.points[i].y);
         }
-        path_msg.closed_path.data=true;
+        path_msg.closed_path.data=closed;
 
         waypoint_pub_->publish(path_msg);
         //path_marker(path_msg);
@@ -58,7 +63,10 @@ class WayPointsNode : public rclcpp::Node{
 
         try {
             YAML::Node config = YAML::LoadFile(path_yaml);
+			YAML::Node closed_node = config["closed"];
             YAML::Node points_node = config["points"];
+			
+			closed=closed_node.as<bool>();
     
             for (const auto& point : points_node) {
                 if (point.IsSequence() && point.size() == 2) {
@@ -104,6 +112,7 @@ class WayPointsNode : public rclcpp::Node{
 
     //std::vector<Point_t> points = {{0.0,1.0},{1.0,1.0},{2.0,0.0},{2.0,-1.0},{1.0,-2.0},{0.0,-2.0},{-1.0,-1.0},{-1.0,0.0}};    
     std::vector<Point_t> points;
+	bool closed;
     std::string path_yaml;
 };
 
