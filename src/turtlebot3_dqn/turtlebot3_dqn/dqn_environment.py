@@ -66,7 +66,7 @@ class RLEnvironment(Node):
         self.local_step = 0
         self.stop_cmd_vel_timer = None
         self.angular_vel = [1.5, 0.75, 0.0, -0.75, -1.5]
-
+        
         qos = QoSProfile(depth=10)
 
         if ROS_DISTRO == 'humble':
