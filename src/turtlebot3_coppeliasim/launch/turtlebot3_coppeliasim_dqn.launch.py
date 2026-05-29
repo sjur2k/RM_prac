@@ -46,7 +46,8 @@ def launch_setup(context, *args, **kwargs):
         '1': '',
         '2': '_static_obs',
         '3': '_moving_obs',
-        '4': '_map'
+        '4': '_map',
+        '5': '_boost'
     }
 
     suffix = suffix_map.get(scene_num, '')

@@ -1,0 +1,6 @@
+---
+float32 pose_x
+float32 pose_y
+float32 boost_pose_x
+float32 boost_pose_y
+bool success
