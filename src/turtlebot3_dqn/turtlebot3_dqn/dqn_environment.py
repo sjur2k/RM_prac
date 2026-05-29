@@ -1,390 +1,435 @@
 #!/usr/bin/env python3
-#################################################################################
-# Copyright 2019 ROBOTIS CO., LTD.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#################################################################################
-#
-# Authors: Ryan Shim, Gilbert, ChanHyeong Lee
-
 import math
 import os
+import time
 
-from geometry_msgs.msg import Twist
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import Twist, TwistStamped
 from nav_msgs.msg import Odometry
 import numpy
+from enum import Enum
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from rclpy.qos import QoSProfile
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import qos_profile_sensor_data, QoSProfile
 from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty
 
-from turtlebot3_msgs.srv import Dqn
-from turtlebot3_msgs.srv import Goal
+from turtlebot3_msgs.srv import Dqn, Goal
 
 
 ROS_DISTRO = os.environ.get('ROS_DISTRO')
+class CurrentGoal(Enum):
+    BOOST = 0
+    GOAL = 1
+    IDLE = -1
 
+boost_multiplier = 2.0
 
 class RLEnvironment(Node):
 
     def __init__(self):
         super().__init__('rl_environment')
+        # Decision
+        self.current_goal = CurrentGoal.IDLE
+        self.velocity_multiplier = 1.0
+
+        # Pose state
         self.goal_pose_x = 0.0
         self.goal_pose_y = 0.0
+        self.boost_pose_x = 0.0
+        self.boost_pose_y = 0.0
         self.robot_pose_x = 0.0
         self.robot_pose_y = 0.0
+        self.robot_pose_theta = 0.0
 
-        self.action_size = 5
-        self.max_step = 800
-
-        self.done = False
-        self.fail = False
-        self.succeed = False
-
+        # Derived state
         self.goal_angle = 0.0
+        self.boost_angle = 0.0
         self.goal_distance = 1.0
-        self.init_goal_distance = 0.5
-        self.scan_ranges = []
-        self.front_ranges = []
+        self.boost_distance = 1.0
         self.min_obstacle_distance = 10.0
-        self.is_front_min_actual_front = False
-
-        self.local_step = 0
-        self.stop_cmd_vel_timer = None
-        self.angular_vel = [1.5, 0.75, 0.0, -0.75, -1.5]
-        
-        qos = QoSProfile(depth=10)
-
-        if ROS_DISTRO == 'humble':
-            self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', qos)
-        else:
-            self.cmd_vel_pub = self.create_publisher(TwistStamped, 'cmd_vel', qos)
-
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            'odom',
-            self.odom_sub_callback,
-            qos
-        )
-        self.scan_sub = self.create_subscription(
-            LaserScan,
-            'scan',
-            self.scan_sub_callback,
-            qos_profile_sensor_data
-        )
-
-        self.clients_callback_group = MutuallyExclusiveCallbackGroup()
-        self.task_succeed_client = self.create_client(
-            Goal,
-            'task_succeed',
-            callback_group=self.clients_callback_group
-        )
-        self.task_failed_client = self.create_client(
-            Goal,
-            'task_failed',
-            callback_group=self.clients_callback_group
-        )
-        self.initialize_environment_client = self.create_client(
-            Goal,
-            'initialize_env',
-            callback_group=self.clients_callback_group
-        )
-
-        self.rl_agent_interface_service = self.create_service(
-            Dqn,
-            'rl_agent_interface',
-            self.rl_agent_interface_callback
-        )
-        self.make_environment_service = self.create_service(
-            Empty,
-            'make_environment',
-            self.make_environment_callback
-        )
-        self.reset_environment_service = self.create_service(
-            Dqn,
-            'reset_environment',
-            self.reset_environment_callback
-        )
-
-    def make_environment_callback(self, request, response):
-        self.get_logger().info('Make environment called')
-        while not self.initialize_environment_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn(
-                'service for initialize the environment is not available, waiting ...'
-            )
-        future = self.initialize_environment_client.call_async(Goal.Request())
-        rclpy.spin_until_future_complete(self, future)
-        response_goal = future.result()
-        if not response_goal.success:
-            self.get_logger().error('initialize environment request failed')
-        else:
-            self.goal_pose_x = response_goal.pose_x
-            self.goal_pose_y = response_goal.pose_y
-            self.get_logger().info(
-                'goal initialized at [%f, %f]' % (self.goal_pose_x, self.goal_pose_y)
-            )
-
-        return response
-
-    def reset_environment_callback(self, request, response):
-        state = self.calculate_state()
-        self.init_goal_distance = state[0]
-        self.prev_goal_distance = self.init_goal_distance
-        response.state = state
-
-        return response
-
-    def call_task_succeed(self):
-        while not self.task_succeed_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn('service for task succeed is not available, waiting ...')
-        future = self.task_succeed_client.call_async(Goal.Request())
-        rclpy.spin_until_future_complete(self, future)
-        if future.result() is not None:
-            response = future.result()
-            self.goal_pose_x = response.pose_x
-            self.goal_pose_y = response.pose_y
-            self.get_logger().info('service for task succeed finished')
-        else:
-            self.get_logger().error('task succeed service call failed')
-
-    def call_task_failed(self):
-        while not self.task_failed_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn('service for task failed is not available, waiting ...')
-        future = self.task_failed_client.call_async(Goal.Request())
-        rclpy.spin_until_future_complete(self, future)
-        if future.result() is not None:
-            response = future.result()
-            self.goal_pose_x = response.pose_x
-            self.goal_pose_y = response.pose_y
-            self.get_logger().info('service for task failed finished')
-        else:
-            self.get_logger().error('task failed service call failed')
-
-    def scan_sub_callback(self, scan):
         self.scan_ranges = []
         self.front_ranges = []
         self.front_angles = []
 
-        num_of_lidar_rays = len(scan.ranges)
+        # Lifecycle flags
+        self._goal_initialized = False
+        self._have_odom = False
+        self._busy = False   # prevents overlapping service calls
+        self.done = False
+        self.succeed = False
+        self.fail = False
+
+        # RL leftovers we don't really use now but keep for compatibility
+        self.action_size = 5
+        self.max_step = 800
+        self.local_step = 0
+        self.angular_vel = [1.5, 0.75, 0.0, -0.75, -1.5]
+        self.init_goal_distance = 0.5
+        self.stop_cmd_vel_timer = None
+
+        qos = QoSProfile(depth=10)
+
+        # Publishers
+        if ROS_DISTRO == 'humble':
+            self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', qos)
+        else:
+            self.cmd_vel_pub = self.create_publisher(TwistStamped, 'cmd_vel', qos)
+        
+
+        # Subscribers
+        self.odom_sub = self.create_subscription(
+            Odometry, 'odom', self.odom_sub_callback, qos
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan, 'scan', self.scan_sub_callback, qos_profile_sensor_data
+        )
+
+        # Service clients
+        self.clients_callback_group = MutuallyExclusiveCallbackGroup()
+        self.task_succeed_client = self.create_client(
+            Goal, 'task_succeed', callback_group=self.clients_callback_group
+        )
+        self.task_failed_client = self.create_client(
+            Goal, 'task_failed', callback_group=self.clients_callback_group
+        )
+        self.initialize_environment_client = self.create_client(
+            Goal, 'initialize_env', callback_group=self.clients_callback_group
+        )
+
+        # In __init__, replace the three service server definitions with:
+        self.services_cbg = MutuallyExclusiveCallbackGroup()
+        self.rl_agent_interface_service = self.create_service(
+            Dqn, 'rl_agent_interface', self.rl_agent_interface_callback,
+            callback_group=self.services_cbg
+        )
+        self.make_environment_service = self.create_service(
+            Empty, 'make_environment', self.make_environment_callback
+        )
+        self.reset_environment_service = self.create_service(
+            Dqn, 'reset_environment', self.reset_environment_callback
+        )
+
+        # Auto-initialize the goal (no need to call make_environment manually)
+        self._init_timer = self.create_timer(1.0, self._try_initialize)
+        self.control_timer = self.create_timer(0.1, self.control_loop)
+        self._log_counter = 0
+
+    # ---------- Goal initialization (non-blocking) ----------
+    def _try_initialize(self):
+        if self._goal_initialized or self._busy:
+            return
+        if not self.initialize_environment_client.service_is_ready():
+            self.get_logger().info('Waiting for initialize_env service...')
+            return
+        self._busy = True
+        self.get_logger().info('Initializing goal...')
+        future = self.initialize_environment_client.call_async(Goal.Request())
+        future.add_done_callback(self._init_done)
+
+    def _init_done(self, future):
+        self._busy = False
+        try:
+            result = future.result()
+        except Exception as e:
+            self.get_logger().error(f'init failed: {e}')
+            return
+        if result and result.success:
+            self.goal_pose_x = result.pose_x
+            self.goal_pose_y = result.pose_y
+            self.boost_pose_x = result.boost_pose_x
+            self.boost_pose_y = result.boost_pose_y
+            self._goal_initialized = True
+            self._init_timer.cancel()
+            self.get_logger().info(
+                f'Goal initialized at ({self.goal_pose_x:.2f}, {self.goal_pose_y:.2f})'
+            )
+            self.get_logger().info(
+                f'Boost initialized at ({self.boost_pose_x:.2f}, {self.boost_pose_y:.2f})'
+            )
+
+    # ---------- Async wrappers for task_succeed / task_failed ----------
+    def _request_new_goal(self, client, label):
+        if self._busy:
+            return
+        if not client.service_is_ready():
+            return
+        self._busy = True
+        self.get_logger().info(f'Requesting {label}...')
+        future = client.call_async(Goal.Request())
+        future.add_done_callback(lambda f: self._goal_update_done(f, label))
+
+    def _goal_update_done(self, future, label):
+        try:
+            result = future.result()
+        except Exception as e:
+            self.get_logger().error(f'{label} failed: {e}')
+            self._busy = False
+            return
+
+        # Save OLD goal position before overwriting
+        old_goal_x = self.goal_pose_x
+        old_goal_y = self.goal_pose_y
+
+        if result is not None:
+            self.goal_pose_x = result.pose_x
+            self.goal_pose_y = result.pose_y
+            self.boost_pose_x = result.boost_pose_x
+            self.boost_pose_y = result.boost_pose_y
+            ...
+
+        self.current_goal = CurrentGoal.IDLE
+        self.done = False
+        self.succeed = False
+        self.fail = False
+        self.local_step = 0
+
+        # Wait until robot has moved away from the OLD goal
+        reset_ok = False
+        timeout = time.time() + 3.0
+        while time.time() < timeout:
+            dist_from_old_goal = math.hypot(
+                self.robot_pose_x - old_goal_x,
+                self.robot_pose_y - old_goal_y
+            )
+            if dist_from_old_goal > 0.5:
+                reset_ok = True
+                break
+            time.sleep(0.05)
+
+        if not reset_ok:
+            self.get_logger().warn('Timeout waiting for robot to reset position')
+
+        self._busy = False
+
+    # ---------- Sensor callbacks ----------
+    def scan_sub_callback(self, scan):
+        self.scan_ranges = []
+        self.front_ranges = []
+        self.front_angles = []
         angle_min = scan.angle_min
         angle_increment = scan.angle_increment
-
-        self.front_distance = scan.ranges[0]
-
-        for i in range(num_of_lidar_rays):
+        for i, distance in enumerate(scan.ranges):
             angle = angle_min + i * angle_increment
-            distance = scan.ranges[i]
-
             if distance == float('Inf'):
                 distance = 3.5
             elif numpy.isnan(distance):
-                distance = 0.0
-
+                distance = 3.5  # treat NaN as far, not zero!
             self.scan_ranges.append(distance)
-
-            if (0 <= angle <= math.pi/2) or (3*math.pi/2 <= angle <= 2*math.pi):
+            if (0 <= angle <= math.pi / 2) or (3 * math.pi / 2 <= angle <= 2 * math.pi):
                 self.front_ranges.append(distance)
                 self.front_angles.append(angle)
-
-        self.min_obstacle_distance = min(self.scan_ranges)
-        self.front_min_obstacle_distance = min(self.front_ranges) if self.front_ranges else 10.0
+        self.min_obstacle_distance = min(self.scan_ranges) if self.scan_ranges else 10.0
 
     def odom_sub_callback(self, msg):
         self.robot_pose_x = msg.pose.pose.position.x
         self.robot_pose_y = msg.pose.pose.position.y
-        _, _, self.robot_pose_theta = self.euler_from_quaternion(msg.pose.pose.orientation)
+        _, _, self.robot_pose_theta = self.euler_from_quaternion(
+            msg.pose.pose.orientation
+        )
 
-        goal_distance = math.sqrt(
-            (self.goal_pose_x - self.robot_pose_x) ** 2
-            + (self.goal_pose_y - self.robot_pose_y) ** 2)
-        path_theta = math.atan2(
-            self.goal_pose_y - self.robot_pose_y,
-            self.goal_pose_x - self.robot_pose_x)
+        dx = self.goal_pose_x - self.robot_pose_x
+        dy = self.goal_pose_y - self.robot_pose_y
+        dx_boost = self.boost_pose_x - self.robot_pose_x
+        dy_boost = self.boost_pose_y - self.robot_pose_y
+        self.goal_distance = math.hypot(dx, dy)
+        self.boost_distance = math.hypot(dx_boost,dy_boost)
 
-        goal_angle = path_theta - self.robot_pose_theta
-        if goal_angle > math.pi:
-            goal_angle -= 2 * math.pi
+        path_theta = math.atan2(dy, dx)
+        path_theta_boost = math.atan2(dy_boost, dx_boost)
+        angle = path_theta - self.robot_pose_theta + math.pi
+        angle_boost = path_theta_boost - self.robot_pose_theta + math.pi
+        # Wrap to [-pi, pi]
+        self.goal_angle = math.atan2(math.sin(angle), math.cos(angle))
+        self.boost_angle = math.atan2(math.sin(angle_boost), math.cos(angle_boost))
+        self._have_odom = True
 
-        elif goal_angle < -math.pi:
-            goal_angle += 2 * math.pi
+    # ---------- Control loop ----------
+    def controller(self, r_dist, r_angle):
+        k_linear = 0.5
+        k_angular = 1.5
+        std_linear = 0.11
+        max_angular = 2.0
+        align_threshold = 0.2  # rad — must be well aligned before moving
 
-        self.goal_distance = goal_distance
-        self.goal_angle = goal_angle
+        angle_factor = max(0.0, 1.0 - abs(r_angle) / align_threshold)
 
-    def calculate_state(self):
-        state = []
-        state.append(float(self.goal_distance))
-        state.append(float(self.goal_angle))
-        for var in self.front_ranges:
-            state.append(float(var))
-        self.local_step += 1
+        v = min(k_linear * r_dist, std_linear) * angle_factor
+        omega = k_angular * r_angle
+        omega = max(-max_angular, min(max_angular, omega))
 
-        if self.goal_distance < 0.20:
-            self.get_logger().info('Goal Reached')
+        return v, omega
+
+    def control_loop(self):
+        # Log every 10th tick to reduce spam
+        self._log_counter += 1
+        if self._log_counter % 10 == 0:
+            self.get_logger().info(
+                f'goal=({self.goal_pose_x:.2f},{self.goal_pose_y:.2f}) '
+                f'goal dist={self.goal_distance:.2f} ang={self.goal_angle:.2f} '
+                f'boost=({self.boost_pose_x:.2f},{self.boost_pose_y:.2f}) '
+                f'boost dist={self.boost_distance:.2f} ang={self.boost_angle:.2f} '
+                f'min_obs={self.min_obstacle_distance:.2f} done={self.done}'
+            )
+
+        # Don't act until we know where we are AND where the goal is
+        if not self._goal_initialized or not self._have_odom:
+            return
+
+        # Don't act while waiting for a new goal from a previous episode end
+        if self._busy:
+            self._publish_stop()
+            return
+
+        # Arrived?
+        if self.goal_distance < 0.20 and self.current_goal==CurrentGoal.GOAL and not self.done:
+            self.get_logger().info('Goal reached!')
             self.succeed = True
             self.done = True
-            if ROS_DISTRO == 'humble':
-                self.cmd_vel_pub.publish(Twist())
-            else:
-                self.cmd_vel_pub.publish(TwistStamped())
-            self.local_step = 0
-            self.call_task_succeed()
+            self.velocity_multiplier = 1.0
+            self._publish_stop()
+            self._request_new_goal(self.task_succeed_client, 'task_succeed')
+            return
 
-        if self.min_obstacle_distance < 0.15:
-            self.get_logger().info('Collision happened')
+        if self.boost_distance < 0.20 and self.current_goal==CurrentGoal.BOOST and not self.done:
+            self.get_logger().info('Boost reached!')
+            self.velocity_multiplier = boost_multiplier
+            self._publish_stop()
+            self.current_goal = CurrentGoal.GOAL
+            return
+
+        # Collision?
+        obstacle_is_boost = abs(self.min_obstacle_distance - self.boost_distance) < 0.15
+        target_distance = self.boost_distance if self.current_goal == CurrentGoal.BOOST else self.goal_distance
+        if self.min_obstacle_distance < 0.15 and target_distance > 0.25 and not self.done and not obstacle_is_boost:
+            self.get_logger().info('Collision!')
             self.fail = True
             self.done = True
-            if ROS_DISTRO == 'humble':
-                self.cmd_vel_pub.publish(Twist())
-            else:
-                self.cmd_vel_pub.publish(TwistStamped())
-            self.local_step = 0
-            self.call_task_failed()
+            self.velocity_multiplier = 1.0
+            self._publish_stop()
+            self._request_new_goal(self.task_failed_client, 'task_failed')
+            return
 
-        if self.local_step == self.max_step:
-            self.get_logger().info('Time out!')
-            self.fail = True
-            self.done = True
-            if ROS_DISTRO == 'humble':
-                self.cmd_vel_pub.publish(Twist())
-            else:
-                self.cmd_vel_pub.publish(TwistStamped())
-            self.local_step = 0
-            self.call_task_failed()
+        # Wait
+        if self.done:
+            self._publish_stop()
+            return
+        
+        # Control the robot towards the current goal.
+        if self.current_goal == CurrentGoal.BOOST:
+            v,omega = self.controller(self.boost_distance,self.boost_angle)
+        elif self.current_goal == CurrentGoal.GOAL:
+            v,omega = self.controller(self.goal_distance,self.goal_angle)
+        elif self.current_goal == CurrentGoal.IDLE:
+            return
+        self._publish_cmd(self.velocity_multiplier*v, omega)
 
-        return state
+    def _publish_cmd(self, v, omega):
+        if ROS_DISTRO == 'humble':
+            msg = Twist()
+            msg.linear.x = float(v)
+            msg.angular.z = float(omega)
+        else:
+            msg = TwistStamped()
+            msg.twist.linear.x = float(v)
+            msg.twist.angular.z = float(omega)
+        self.cmd_vel_pub.publish(msg)
 
-    def compute_directional_weights(self, relative_angles, max_weight=10.0):
-        power = 6
-        raw_weights = (numpy.cos(relative_angles))**power + 0.1
-        scaled_weights = raw_weights * (max_weight / numpy.max(raw_weights))
-        normalized_weights = scaled_weights / numpy.sum(scaled_weights)
-        return normalized_weights
+    def _publish_stop(self):
+        self._publish_cmd(0.0, 0.0)
 
-    def compute_weighted_obstacle_reward(self):
-        if not self.front_ranges or not self.front_angles:
-            return 0.0
-
-        front_ranges = numpy.array(self.front_ranges)
-        front_angles = numpy.array(self.front_angles)
-
-        valid_mask = front_ranges <= 0.5
-        if not numpy.any(valid_mask):
-            return 0.0
-
-        front_ranges = front_ranges[valid_mask]
-        front_angles = front_angles[valid_mask]
-
-        relative_angles = numpy.unwrap(front_angles)
-        relative_angles[relative_angles > numpy.pi] -= 2 * numpy.pi
-
-        weights = self.compute_directional_weights(relative_angles, max_weight=10.0)
-
-        safe_dists = numpy.clip(front_ranges - 0.25, 1e-2, 3.5)
-        decay = numpy.exp(-3.0 * safe_dists)
-
-        weighted_decay = numpy.dot(weights, decay)
-
-        reward = - (1.0 + 4.0 * weighted_decay)
-
-        return reward
-
-    def calculate_reward(self):
-        yaw_reward = 1 - (2 * abs(self.goal_angle) / math.pi)
-        obstacle_reward = self.compute_weighted_obstacle_reward()
-
-        print('directional_reward: %f, obstacle_reward: %f' % (yaw_reward, obstacle_reward))
-        reward = yaw_reward + obstacle_reward
-
-        if self.succeed:
-            reward = 100.0
-        elif self.fail:
-            reward = -50.0
-
-        return reward
+    # ---------- Compatibility stubs (unchanged behavior for the RL path) ----------
+    def make_environment_callback(self, request, response):
+        # No-op: initialization happens automatically in _try_initialize.
+        self.get_logger().info('make_environment called (no-op, auto-init in use)')
+        return response
+    
+    def reset_environment_callback(self, request, response):
+        while self._busy:
+            time.sleep(0.02)
+        self.current_goal = CurrentGoal.IDLE
+        self.done = False
+        self.succeed = False
+        self.fail = False
+        self.local_step = 0
+        self.velocity_multiplier = 1.0
+        response.state = [
+            float(self.robot_pose_x), float(self.robot_pose_y),
+            float(self.goal_pose_x), float(self.goal_pose_y),
+            float(self.boost_pose_x), float(self.boost_pose_y)
+        ]
+        return response
 
     def rl_agent_interface_callback(self, request, response):
         action = request.action
-        if ROS_DISTRO == 'humble':
-            msg = Twist()
-            msg.linear.x = 0.2
-            msg.angular.z = self.angular_vel[action]
+
+        # Calculate optimal action
+        d_goal = math.hypot(self.goal_pose_x - self.robot_pose_x,
+                            self.goal_pose_y - self.robot_pose_y)
+        d_boost = math.hypot(self.boost_pose_x - self.robot_pose_x,
+                            self.boost_pose_y - self.robot_pose_y)
+        d_boost_to_goal = math.hypot(self.goal_pose_x - self.boost_pose_x,
+                                    self.goal_pose_y - self.boost_pose_y)
+
+        boost_is_optimal = (d_boost + d_boost_to_goal / boost_multiplier) < d_goal
+
+        correct_action = 0 if boost_is_optimal else 1
+
+        if action != correct_action:
+            # Wrong decision — fail immediately without executing
+            response.state = [
+                float(self.robot_pose_x), float(self.robot_pose_y),
+                float(self.goal_pose_x), float(self.goal_pose_y),
+                float(self.boost_pose_x), float(self.boost_pose_y)
+            ]
+            response.reward = -100.0
+            response.done = True
+            return response
+
+        # Correct decision — execute and wait for episode end
+        if action == 0:
+            self.current_goal = CurrentGoal.BOOST
         else:
-            msg = TwistStamped()
-            msg.twist.linear.x = 0.2
-            msg.twist.angular.z = self.angular_vel[action]
+            self.current_goal = CurrentGoal.GOAL
+            self.velocity_multiplier = 1.0
 
-        self.cmd_vel_pub.publish(msg)
-        if self.stop_cmd_vel_timer is None:
-            self.prev_goal_distance = self.init_goal_distance
-            self.stop_cmd_vel_timer = self.create_timer(0.8, self.timer_callback)
-        else:
-            self.destroy_timer(self.stop_cmd_vel_timer)
-            self.stop_cmd_vel_timer = self.create_timer(0.8, self.timer_callback)
+        while not self.done:
+            time.sleep(0.05)
 
-        response.state = self.calculate_state()
-        response.reward = self.calculate_reward()
-        response.done = self.done
-
-        if self.done is True:
-            self.done = False
-            self.succeed = False
-            self.fail = False
-
+        reward = 100.0 - self.local_step * 0.1
+        response.state = [
+            float(self.robot_pose_x), float(self.robot_pose_y),
+            float(self.goal_pose_x), float(self.goal_pose_y),
+            float(self.boost_pose_x), float(self.boost_pose_y)
+        ]
+        response.reward = reward
+        response.done = True
         return response
 
-    def timer_callback(self):
-        self.get_logger().info('Stop called')
-        if ROS_DISTRO == 'humble':
-            self.cmd_vel_pub.publish(Twist())
-        else:
-            self.cmd_vel_pub.publish(TwistStamped())
-        self.destroy_timer(self.stop_cmd_vel_timer)
-
     def euler_from_quaternion(self, quat):
-        x = quat.x
-        y = quat.y
-        z = quat.z
-        w = quat.w
-
+        x, y, z, w = quat.x, quat.y, quat.z, quat.w
         sinr_cosp = 2 * (w * x + y * z)
         cosr_cosp = 1 - 2 * (x * x + y * y)
-        roll = numpy.arctan2(sinr_cosp, cosr_cosp)
-
-        sinp = 2 * (w * y - z * x)
-        pitch = numpy.arcsin(sinp)
-
+        roll = math.atan2(sinr_cosp, cosr_cosp)
+        sinp = max(-1.0, min(1.0, 2 * (w * y - z * x)))
+        pitch = math.asin(sinp)
         siny_cosp = 2 * (w * z + x * y)
         cosy_cosp = 1 - 2 * (y * y + z * z)
-        yaw = numpy.arctan2(siny_cosp, cosy_cosp)
-
+        yaw = math.atan2(siny_cosp, cosy_cosp)
         return roll, pitch, yaw
-
 
 def main(args=None):
     rclpy.init(args=args)
-    rl_environment = RLEnvironment()
+    node = RLEnvironment()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        while rclpy.ok():
-            rclpy.spin_once(rl_environment, timeout_sec=0.1)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        rl_environment.destroy_node()
+        node.destroy_node()
         rclpy.shutdown()
 
 

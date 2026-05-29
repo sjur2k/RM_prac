@@ -37,7 +37,6 @@ ROS_DISTRO = os.environ.get('ROS_DISTRO')
 if ROS_DISTRO == 'humble':
     from std_srvs.srv import Trigger
     from std_srvs.srv import Empty
-    from geometry_msgs.msg import Pose
 
 
 class CoppeliaSimInterface(Node):
@@ -46,8 +45,10 @@ class CoppeliaSimInterface(Node):
         super().__init__('coppeliasim_interface')
 
         self.entity_name = 'goal_box'
-        self.entity_pose_x = 0.25
-        self.entity_pose_y = 0.0
+        self.goal_pose_x = 0.0
+        self.goal_pose_y = 0.0
+        self.boost_pose_x = 0.0
+        self.boost_pose_y = 0.0
 
         self.new_goal_client = self.create_client(Trigger, 'new_goal')
         self.reset_simulation_client = self.create_client(Empty, 'reset_simulation')
@@ -73,33 +74,40 @@ class CoppeliaSimInterface(Node):
         )
         
     def new_goal(self):
-        new_goal_req = Trigger.Request()
-        while not self.new_goal_client.wait_for_service(timeout_sec=1.0):
+        tmp_node = rclpy.create_node('_new_goal_tmp')
+        tmp_client = tmp_node.create_client(Trigger, 'new_goal')
+        while not tmp_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn('service for new goal is not available, waiting ...')
-        future = self.new_goal_client.call_async(new_goal_req)
-        rclpy.spin_until_future_complete(self, future)
+        future = tmp_client.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(tmp_node, future)
+        tmp_node.destroy_node()
         if future.result() is not None:
-            response = future.result()
-            #print(f'{Response: {response.message}')
-            data = json.loads(response.message)
-            self.entity_pose_x = data["x"]
-            self.entity_pose_y = data["y"]
-            self.get_logger().info('service for task succeed finished')
+            data = json.loads(future.result().message)
+            self.goal_pose_x = data["gx"]
+            self.goal_pose_y = data["gy"]
+            self.boost_pose_x = data["bx"]
+            self.boost_pose_y = data["by"]
+            self.get_logger().info('new_goal service finished')
         else:
-            self.get_logger().error('task succeed service call failed')
+            self.get_logger().error('new_goal service call failed')
 
     def reset_simulation(self):
-        reset_req = Empty.Request()
-
-        while not self.reset_simulation_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn('service for reset_simulation is not available, waiting ...')
-
-        self.reset_simulation_client.call_async(reset_req)
+        tmp_node = rclpy.create_node('_reset_sim_tmp')
+        tmp_client = tmp_node.create_client(Empty,'reset_simulation')
+        while not tmp_client.wait_for_service(timeout_sec = 1.0):
+            self.get_logger().warn('reset_simulation service not availablem waiting...')
+        future = tmp_client.call_async(Empty.Request())
+        rclpy.spin_until_future_complete(tmp_node,future)
+        tmp_node.destroy_node()
 
     def task_succeed_callback(self, request, response):
+        self.reset_simulation()
+        time.sleep(0.2)
         self.new_goal()
-        response.pose_x = self.entity_pose_x
-        response.pose_y = self.entity_pose_y
+        response.pose_x = self.goal_pose_x
+        response.pose_y = self.goal_pose_y
+        response.boost_pose_x = self.boost_pose_x
+        response.boost_pose_y = self.boost_pose_y
         response.success = True
         return response
 
@@ -107,8 +115,10 @@ class CoppeliaSimInterface(Node):
         self.reset_simulation()
         time.sleep(0.2)
         self.new_goal()
-        response.pose_x = self.entity_pose_x
-        response.pose_y = self.entity_pose_y
+        response.pose_x = self.goal_pose_x
+        response.pose_y = self.goal_pose_y
+        response.boost_pose_x = self.boost_pose_x
+        response.boost_pose_y = self.boost_pose_y
         response.success = True
         return response
 
@@ -116,8 +126,10 @@ class CoppeliaSimInterface(Node):
         self.reset_simulation()
         time.sleep(0.2)
         self.new_goal()
-        response.pose_x = self.entity_pose_x
-        response.pose_y = self.entity_pose_y
+        response.pose_x = self.goal_pose_x
+        response.pose_y = self.goal_pose_y
+        response.boost_pose_x = self.boost_pose_x
+        response.boost_pose_y = self.boost_pose_y
         response.success = True
         return response
 

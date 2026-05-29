@@ -24,7 +24,6 @@ import math
 import os
 import random
 import sys
-import time
 
 import numpy
 import rclpy
@@ -142,8 +141,8 @@ class DQNAgent(Node):
             self.tf.config.set_visible_devices([], 'GPU')
 
         self.train_mode = True
-        self.state_size = 26
-        self.action_size = 5
+        self.state_size = 6
+        self.action_size = 2
 
         self.done = False
         self.succeed = False
@@ -160,7 +159,7 @@ class DQNAgent(Node):
         self.batch_size = 128
 
         self.replay_memory = collections.deque(maxlen=500000)
-        self.min_replay_memory_size = 5000
+        self.min_replay_memory_size = 500
 
         self.model = self.create_qnetwork()
         self.use_pretrained_model = bool(model_file)
@@ -215,7 +214,6 @@ class DQNAgent(Node):
 
     def process(self):
         self.env_make()
-        time.sleep(1.0)
 
         episode_num = self.load_episode
 
@@ -225,8 +223,6 @@ class DQNAgent(Node):
             local_step = 0
             score = 0
             sum_max_q = 0.0
-
-            time.sleep(1.0)
 
             while True:
                 local_step += 1
@@ -267,14 +263,14 @@ class DQNAgent(Node):
                         'Episode:', episode,
                         'score:', score,
                         'memory length:', len(self.replay_memory),
-                        'epsilon:', self.epsilon)
+                        'epsilon:', self.epsilon,
+                        flush=True)
 
                     param_keys = ['epsilon', 'step_counter', 'trained_episodes']
                     param_values = [self.epsilon, self.step_counter, episode]
                     param_dictionary = dict(zip(param_keys, param_values))
                     break
 
-                time.sleep(0.01)
 
             if self.train_mode:
                 if episode % 100 == 0:
@@ -361,15 +357,13 @@ class DQNAgent(Node):
     def create_qnetwork(self):
         model = self.Sequential()
         model.add(self.Input(shape=(self.state_size,)))
-        model.add(self.Dense(512, activation='relu'))
-        model.add(self.Dense(256, activation='relu'))
-        model.add(self.Dense(128, activation='relu'))
+        model.add(self.Dense(64, activation='relu'))
+        model.add(self.Dense(64, activation='relu'))
         model.add(self.Dense(self.action_size, activation='linear'))
         model.compile(
             loss=self.MeanSquaredError(),
             optimizer=self.Adam(learning_rate=self.learning_rate))
         model.summary()
-
         return model
 
     def update_target_model(self):
